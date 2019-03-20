@@ -28,6 +28,7 @@ DEFAULT_IPC_PATH = os.path.join(
 class Settings(object):
     
     default_global_settings = {
+        'ffmpeg_path': 'ffmpeg',
         'ipc_path': DEFAULT_IPC_PATH,
         'log_level': 'INFO',
         'log_format': (
