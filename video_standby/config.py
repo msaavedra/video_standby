@@ -41,7 +41,7 @@ class Settings(object):
         'location': 'rtsp://localhost/',
         'codec': 'h264',
         'save_directory': os.path.expanduser('~'),
-        'buffer_interval': 2,
+        'buffer_duration': 2,
         }
     
     def __init__(self, path):
