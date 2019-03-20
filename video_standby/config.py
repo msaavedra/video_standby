@@ -37,7 +37,12 @@ class Settings(object):
             ' - %(message)s'
             )
         }
-    default_source_settings = {}
+    default_source_settings = {
+        'location': 'rtsp://localhost/',
+        'codec': 'h264',
+        'save_directory': os.path.expanduser('~'),
+        'buffer_interval': 2,
+        }
     
     def __init__(self, path):
         self.path = path
