@@ -25,6 +25,7 @@ DEFAULT_IPC_PATH = os.path.join(
     'ipc.sock'
     )
 
+
 class Settings(object):
     
     default_global_settings = {
@@ -41,7 +42,7 @@ class Settings(object):
         'location': 'rtsp://localhost/',
         'codec': 'h264',
         'save_directory': os.path.expanduser('~'),
-        'buffer_duration': 2,
+        'buffer_frames': 60,
         }
     
     def __init__(self, path):

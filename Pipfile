@@ -4,10 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-ipython = "*"
 pyyaml = "*"
+opencv-python = "*"
+numpy = "*"
 
 [dev-packages]
+ipython = "*"
 
 [requires]
 python_version = "3.7"
