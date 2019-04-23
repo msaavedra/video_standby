@@ -59,7 +59,7 @@ class Settings(object):
     def _load(self):
         try:
             with open(self.path, 'r') as f:
-                file_settings = yaml.load(f.read())
+                file_settings = yaml.safe_load(f.read())
         except Exception as e:
             sys.stderr.write('Failed opening settings file %s. Reason: %s' % (
                 self.path,
@@ -76,7 +76,7 @@ class Settings(object):
             for (name, source) in file_settings.get('sources', {}).items()
             }
         return {
-            'globals': global_settings,
+            'global': global_settings,
             'sources': sources
             }
     
