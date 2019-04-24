@@ -37,10 +37,15 @@ class StreamCommandSequenceError(Exception):
 class VideoStream:
     
     def __init__(self, name, start_immediately=True):
+        self._status = Value('B', STREAM_STATUS_INITIALIZING)
+        self.buffering_process = None
+        self.recording_process = None
+        self.cap = None
+        
         self.name = name
+        logger.debug(str(settings['sources']))
         self.settings = settings['sources'][name]
         self.command_queue = Queue()
-        self._status = Value('B', STREAM_STATUS_INITIALIZING)
         
         # Load video properties from a sample frame
         temp_capture = self.create_capture_device()
@@ -53,8 +58,6 @@ class VideoStream:
         self.frame_size = sample_frame.nbytes
         del sample_frame
         
-        self.cap = None
-
         # Set up a buffer
         self.frame_count = self.settings['buffer_frames']
         self.frames = tuple(
@@ -67,9 +70,6 @@ class VideoStream:
         self.write_boundary = Condition()
         self.last_write_position = RawValue('I', 0)
         
-        self.buffering_process = None
-        self.recording_process = None
-        self.recording_subprocess = None
         
         if start_immediately:
             self.start_buffering()
@@ -247,7 +247,6 @@ class SharedExclusiveLock:
 
 
 def _buffer_stream(stream):
-    #stream.cap = stream.create_capture_device()
     logger.info('Starting to buffer stream.')
     while stream.status != STREAM_STATUS_CLOSED:
         logger.debug('Writing frame to buffer...')
@@ -284,17 +283,19 @@ def _record_stream(stream):
 
 def test():
     try:
-        name = sys.argv[1]
+        names = sys.argv[1:]
     except IndexError:
-        name = 'default'
-    logger.debug(f'Starting test of {name} camera...')
-    stream = VideoStream(name)
+        names = []
+    logger.info(f'Starting test of {names} cameras...')
+    streams = [VideoStream(name) for name in names]
     time.sleep(30)
-    stream.start_recording()
-    time.sleep(30)
-    stream.stop_recording()
-    stream.close()
-    logger.debug('Starting test...')
+    for stream in streams:
+        stream.start_recording()
+    time.sleep(2)
+    for stream in streams:
+        stream.stop_recording()
+        stream.close()
+    logger.info('Finishing test...')
 
 
 if __name__ == '__main__':
