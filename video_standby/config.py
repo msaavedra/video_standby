@@ -95,5 +95,5 @@ class Settings(object):
     
 
 settings = Settings(
-    sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SETTINGS_PATH
+    os.environ.get('VIDEO_STANDBY_SETTINGS_PATH', DEFAULT_SETTINGS_PATH)
     )
