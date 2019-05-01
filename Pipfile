@@ -7,6 +7,9 @@ name = "pypi"
 pyyaml = "*"
 opencv-python = "*"
 numpy = "*"
+falcon = "*"
+gunicorn = "*"
+requests = "*"
 
 [dev-packages]
 ipython = "*"

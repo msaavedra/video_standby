@@ -29,11 +29,13 @@ DEFAULT_IPC_PATH = os.path.join(
 class Settings(object):
     
     default_global_settings = {
-        'ffmpeg_path': 'ffmpeg',
-        'ipc_path': DEFAULT_IPC_PATH,
+        'hostname': 'localhost',
+        'port': 8080,
+        'handler_count': 2,
         'log_level': 'INFO',
         'log_format': (
             '%(asctime)s: '
+            'pid:%(process)d '
             '%(module)s.%(name)s:%(lineno)s'
             ' - %(message)s'
             )
@@ -41,7 +43,10 @@ class Settings(object):
     default_source_settings = {
         'location': 'rtsp://localhost/',
         'codec': 'h264',
-        'save_directory': os.path.expanduser('~'),
+        'save_directory': os.path.join(
+            os.path.expanduser('~'),
+            'video_standby'
+            ),
         'buffer_frames': 60,
         }
     
@@ -53,6 +58,9 @@ class Settings(object):
     def __getitem__(self, key):
         return self._settings[key]
     
+    def __getattr__(self, name):
+        return self._settings[name]
+    
     def reload_on_update(self):
         return False  # FIXME: add reloading support
     
@@ -61,7 +69,7 @@ class Settings(object):
             with open(self.path, 'r') as f:
                 file_settings = yaml.safe_load(f.read())
         except Exception as e:
-            sys.stderr.write('Failed opening settings file %s. Reason: %s' % (
+            sys.stderr.write_to_buffer('Failed opening settings file %s. Reason: %s' % (
                 self.path,
                 e,
                 ))
@@ -69,16 +77,16 @@ class Settings(object):
         
         global_settings = self._deep_merge(
             self.default_global_settings,
-            file_settings.get('global', {})
+            file_settings.get('globals', {})
             )
         sources = {
             name: self._deep_merge(self.default_source_settings, source)
             for (name, source) in file_settings.get('sources', {}).items()
             }
-        return {
-            'global': global_settings,
+        return SettingsNamespace({
+            'globals': global_settings,
             'sources': sources
-            }
+            })
     
     def _deep_merge(self, base, updates):
         base = base.copy()
@@ -91,8 +99,34 @@ class Settings(object):
             else:
                 base[key] = value
     
-        return base
+        return SettingsNamespace(base)
+
+
+class SettingsNamespace(dict):
+    """A simple read-only namespace to hold settings.
     
+    Example:
+        >>> settings = SettingsNamespace({'test': 'hello'})
+        >>> print(settings.test)
+        hello
+    """
+    def __init__(self, source_dict=None):
+        super().__init__(source_dict or {})
+    
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(
+                f"{type(self).__name__} object has no attribute '{name}'",
+                )
+    
+    def __setattr__(self, name, value):
+        raise NotImplementedError()
+    
+    def __setitem__(self, key, value):
+        raise NotImplementedError()
+
 
 settings = Settings(
     os.environ.get('VIDEO_STANDBY_SETTINGS_PATH', DEFAULT_SETTINGS_PATH)
