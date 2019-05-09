@@ -3,18 +3,31 @@ import logging
 import sys
 
 
+TRACE = logging.DEBUG - 1
+logging.addLevelName(TRACE, 'TRACE')
+
+
 def Logger(settings):
     """A factory function to return the project logger.
     """
     logger = logging.getLogger('video_standby')
     level_name = settings['globals']['log_level']
-    try:
-        level = getattr(logging, level_name)
-    except AttributeError:
-        sys.stderr.write_to_buffer(f'Invalid log level {level_name}.')
-        level_name = settings.default_global_settings.get('log_level', 'INFO')
-        level = getattr(logging, level_name)
-        sys.stderr.write_to_buffer(f'Using log level {level_name} instead.')
+    if level_name == 'TRACE':
+        level = TRACE
+    else:
+        try:
+            level = getattr(logging, level_name)
+        except AttributeError:
+            
+            sys.stderr.write(f'Invalid log level {level_name}.\n')
+            level_name = settings.default_global_settings.get(
+                'log_level',
+                'INFO'
+                )
+            level = getattr(logging, level_name)
+            sys.stderr.write(
+                f'Using log level {level_name} instead.\n'
+                )
     
     logger.setLevel(level)
     
@@ -28,3 +41,10 @@ def Logger(settings):
     
     logger.info(f'Created {level_name} logger.')
     return logger
+
+
+def trace(logger, message, *args, **kwargs):
+    if logger.isEnabledFor(TRACE):
+        logger._log(TRACE, message, args, **kwargs)
+
+logging.Logger.trace = trace

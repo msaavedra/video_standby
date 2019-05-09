@@ -83,7 +83,7 @@ class VideoStream:
                 raise StreamCommandSequenceError('Stream is closed.')
             
             self.buffering_process = Process(
-                target=write_to_buffer,
+                target=buffer,
                 args=(self,),
                 )
             self.buffering_process.start()
@@ -100,7 +100,7 @@ class VideoStream:
             
             self._status.value = STREAM_STATUS_RECORDING
             self.recording_process = Process(
-                target=write_to_file,
+                target=record,
                 args=(self,),
                 )
             self.recording_process.start()
@@ -111,8 +111,78 @@ class VideoStream:
                 return
             
             self._status.value = STREAM_STATUS_STANDBY
+
+    def write_to_buffer(self):
+        """Write frames continuously to the buffer until closed.
+        """
+        logger.info(f'Starting to buffer {self.name} stream.')
     
-    def create_reader(self):
+        with StreamSource(self.name) as source:
+            while self.status != STREAM_STATUS_CLOSED:
+                index = next(self.writer_index_cycle)
+                lock = self.frame_locks[index]
+            
+                with lock.exclusive:
+                    numpy_frame = np.ndarray(
+                        self.frame_shape,
+                        dtype=self.frame_dtype,
+                        buffer=self.frames[index]
+                        )
+                    try:
+                        logger.trace('Capturing frame data to numpy array...')
+                        source.write_frame(numpy_frame)
+                        logger.trace('Finished capturing.')
+                    except StreamError as e:
+                        logger.error(str(e))
+                        raise
+                    except KeyboardInterrupt:
+                        continue
+            
+                # Put up a boundary so that readers can't overtake
+                with self.write_boundary:
+                    self.last_write_position.value = index
+                    self.write_boundary.notify_all()
+    
+        logger.info(f'Finished buffering {self.name} stream.')
+
+    def write_to_file(self):
+        """Copy frames out of the buffer and encode them into a video file.
+        """
+        logger.info('Starting to record stream.')
+        reader = self.create_reader()
+        output_path = os.path.join(
+            self.settings.save_directory,
+            '%s-%s.mp4' % (
+                self.name,
+                time.strftime('%Y%m%d%H%M%S', time.localtime()),
+                )
+            )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        logger.info(f'Writing video to {output_path}.')
+        writer = cv2.VideoWriter(
+            output_path,
+            int(cv2.VideoWriter_fourcc(*'mp4v')),
+            30.0,
+            (self.width, self.height),
+            )
+        try:
+            for index, frame in reader:
+                writer.write(frame)
+                if self.status != STREAM_STATUS_RECORDING:
+                    logger.info('Received record stop command.')
+                    break
+            remaining_frames = self.get_distance_to_write_boundary(
+                index) - 1
+            logger.debug(f'{remaining_frames} remaining frames in buffer.')
+            for i in range(remaining_frames):
+                index, frame = next(reader)
+                writer.write(frame)
+                logger.debug(f'Got {i + 1} of {remaining_frames} from {index}')
+        finally:
+            writer.release()
+            logger.info('Finished recording stream.')
+
+    def create_reader(self, skip_frames=0):
         with self.write_boundary:
             index = self.last_write_position.value - (self.frame_count * .75)
             index = int(index) % self.frame_count
@@ -123,7 +193,10 @@ class VideoStream:
                 if index == self.last_write_position.value:
                     self.write_boundary.wait()
             
-            yield index, self.copy_frame(index)
+            # Yield the frame if we haven't been instructed to skip it.
+            if index % (skip_frames + 1) == 0:
+                yield index, self.copy_frame(index)
+            
             index = (index + 1) % self.frame_count
     
     def copy_frame(self, index):
@@ -145,7 +218,12 @@ class VideoStream:
         else:
             distance = write_position + self.frame_count - index
         
-        logger.info(f'Index:{index}, Boundary:{write_position}, Size:{self.frame_count}, Distance:{distance}')
+        logger.debug(
+            f'Index-{index}, '
+            f'Boundary-{write_position}, '
+            f'Size-{self.frame_count}, ',
+            f'Distance-{distance}'
+            )
         
         return distance
     
@@ -208,7 +286,7 @@ class StreamSource:
         return self
     
     def __exit__(self, type, value, traceback):
-        logger.info('Releasing capture device')
+        logger.debug('Releasing capture device')
         self.cap.release()
 
 
@@ -224,12 +302,12 @@ class SharedExclusiveLock:
         self.shared_counter = RawValue('B', 0)
         
     def acquire_shared(self):
-        logger.debug('Attempting to acquire lock in shared mode...')
+        logger.trace('Attempting to acquire lock in shared mode...')
         with self.shared_counter_lock:
             self.shared_counter.value += 1
             if self.shared_counter.value == 1:
                 self.exclusive_lock.acquire()
-        logger.debug('Acquired lock in shared mode.')
+        logger.trace('Acquired lock in shared mode.')
     
     def release_shared(self):
         with self.shared_counter_lock:
@@ -238,7 +316,7 @@ class SharedExclusiveLock:
             self.shared_counter.value -= 1
             if self.shared_counter.value == 0:
                 self.exclusive_lock.release()
-        logger.debug('Released lock in shared mode.')
+        logger.trace('Released lock in shared mode.')
     
     @property
     @contextmanager
@@ -250,15 +328,15 @@ class SharedExclusiveLock:
             self.release_shared()
     
     def acquire_exclusive(self):
-        logger.debug('Attempting to acquire lock in exclusive mode...')
+        logger.trace('Attempting to acquire lock in exclusive mode...')
         self.shared_counter_lock.acquire()
         self.exclusive_lock.acquire()
-        logger.debug('Acquired lock in exclusive mode.')
+        logger.trace('Acquired lock in exclusive mode.')
     
     def release_exclusive(self):
         self.exclusive_lock.release()
         self.shared_counter_lock.release()
-        logger.debug('Released lock in exclusive mode.')
+        logger.trace('Released lock in exclusive mode.')
     
     @property
     @contextmanager
@@ -269,74 +347,13 @@ class SharedExclusiveLock:
         finally:
             self.release_exclusive()
 
-def write_to_buffer(stream):
-    """Write frames continuously to the buffer until closed.
-    """
-    logger.info(f'Starting to buffer {stream.name} stream.')
 
-    with StreamSource(stream.name) as source:
-        while stream.status != STREAM_STATUS_CLOSED:
-            index = next(stream.writer_index_cycle)
-            lock = stream.frame_locks[index]
-        
-            with lock.exclusive:
-                numpy_frame = np.ndarray(
-                    stream.frame_shape,
-                    dtype=stream.frame_dtype,
-                    buffer=stream.frames[index]
-                    )
-                try:
-                    logger.debug('Capturing frame data to numpy array...')
-                    source.write_frame(numpy_frame)
-                    logger.debug('Finished capturing.')
-                except StreamError as e:
-                    logger.error(str(e))
-                    raise
-                except KeyboardInterrupt:
-                    continue
-        
-            # Put up a boundary so that readers can't overtake
-            with stream.write_boundary:
-                stream.last_write_position.value = index
-                stream.write_boundary.notify_all()
+def buffer(stream):
+    stream.write_to_buffer()
 
-    logger.info(f'Finished buffering {stream.name} stream.')
 
-def write_to_file(stream):
-    """Copy frames out of the buffer and encode them into a video file.
-    """
-    logger.info('Starting to record stream.')
-    reader = stream.create_reader()
-    output_path = os.path.join(
-        stream.settings.save_directory,
-        '%s-%s.mp4' % (
-            stream.name,
-            time.strftime('%Y%m%d%H%M%S', time.localtime()),
-            )
-        )
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    logger.info(f'Writing video to {output_path}.')
-    writer = cv2.VideoWriter(
-        output_path,
-        int(cv2.VideoWriter_fourcc(*'mp4v')),
-        30.0,
-        (stream.width, stream.height),
-        )
-    try:
-        for index, frame in reader:
-            writer.write(frame)
-            if stream.status != STREAM_STATUS_RECORDING:
-                logger.info('Received record stop command.')
-                break
-        remaining_frames = stream.get_distance_to_write_boundary(index) - 1
-        logger.info(f'{remaining_frames} remaining frames in buffer.')
-        for i in range(remaining_frames):
-            index, frame = next(reader)
-            writer.write(frame)
-            logger.info(f'Got {i + 1} of {remaining_frames} from {index}')
-    finally:
-        writer.release()
-        logger.info('Finished recording stream.')
+def record(stream):
+    stream.write_to_file()
 
 
 def test():
@@ -345,11 +362,11 @@ def test():
     def record_stream(stream):
         for _ in range(random.randint(1,5)):
             time.sleep(random.uniform(.1, 45.0))
-            logger.info(f'Starting recording test of {stream.name} camera.')
+            logger.debug(f'Starting recording test of {stream.name} camera.')
             stream.start_recording()
             time.sleep(random.uniform(2.5, 30.0))
             stream.stop_recording()
-            logger.info(f'Finished test of {stream.name} camera.')
+            logger.debug(f'Finished test of {stream.name} camera.')
     
     try:
         names = sys.argv[1:]

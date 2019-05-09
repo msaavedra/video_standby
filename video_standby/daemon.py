@@ -10,7 +10,7 @@ from gunicorn.app.base import BaseApplication
 
 from video_standby.config import settings
 from video_standby.logger import Logger
-from video_standby.stream import VideoStream, STREAM_STATUS_LABELS
+from video_standby.stream import VideoStream, STREAM_STATUS_LABELS, StreamError
 
 
 logger = Logger(settings)
@@ -62,7 +62,10 @@ class StreamRouteConverter(BaseConverter):
         with self.streams_lock:
             for source in settings.sources:
                 if source not in self.streams:
-                    self.streams[source] = VideoStream(source)
+                    try:
+                        self.streams[source] = VideoStream(source)
+                    except StreamError:
+                        logger.error(f'Stream {source} not found.')
     
     def convert(self, value):
         try:

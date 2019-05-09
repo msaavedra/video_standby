@@ -35,6 +35,7 @@ class Settings(object):
         'log_level': 'INFO',
         'log_format': (
             '%(asctime)s: '
+            '[%(levelname)s] '
             'pid:%(process)d '
             '%(module)s.%(name)s:%(lineno)s'
             ' - %(message)s'
