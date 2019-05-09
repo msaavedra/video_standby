@@ -7,6 +7,7 @@ from multiprocessing.sharedctypes import RawArray, RawValue, Value
 import os
 import sys
 import time
+from types import MappingProxyType
 
 import cv2
 import numpy as np
@@ -28,10 +29,6 @@ STREAM_STATUS_LABELS = {
     STREAM_STATUS_RECORDING: 'recording',
     STREAM_STATUS_CLOSED: 'closed'
     }
-
-
-class StreamCommandSequenceError(Exception):
-    pass
 
 
 class VideoStream:
@@ -80,7 +77,11 @@ class VideoStream:
     def start_buffering(self):
         with self._status.get_lock():
             if self._status.value == STREAM_STATUS_CLOSED:
-                raise StreamCommandSequenceError('Stream is closed.')
+                raise StreamError(
+                    self.name,
+                    StreamError.BAD_COMMAND_SEQUENCE,
+                    "can't buffer a closed stream"
+                    )
             
             self.buffering_process = Process(
                 target=buffer,
@@ -93,10 +94,18 @@ class VideoStream:
     def start_recording(self):
         with self._status.get_lock():
             if self._status.value == STREAM_STATUS_CLOSED:
-                raise StreamCommandSequenceError('Stream is closed.')
+                raise StreamError(
+                    self.name,
+                    StreamError.BAD_COMMAND_SEQUENCE,
+                    "can't record a closed stream"
+                    )
             
             if self._status.value == STREAM_STATUS_INITIALIZING:
-                raise StreamCommandSequenceError('Stream is not buffering.')
+                raise StreamError(
+                    self.name,
+                    StreamError.BAD_COMMAND_SEQUENCE,
+                    "can't record a stream that is not buffered"
+                    )
             
             self._status.value = STREAM_STATUS_RECORDING
             self.recording_process = Process(
@@ -133,8 +142,14 @@ class VideoStream:
                         source.write_frame(numpy_frame)
                         logger.trace('Finished capturing.')
                     except StreamError as e:
-                        logger.error(str(e))
-                        raise
+                        if e.code == StreamError.SOURCE_UNAVAILABLE:
+                            logger.warning(
+                                f'{e.stream_name} - stream is unavailable.'
+                                )
+                            time.sleep(5)
+                        else:
+                            logger.error(str(e))
+                            raise
                     except KeyboardInterrupt:
                         continue
             
@@ -258,40 +273,65 @@ class VideoStream:
 class StreamSource:
     
     def __init__(self, name):
+        self.name = name
         self.cap = cv2.VideoCapture(settings.sources[name].location)
     
     def write_frame(self, destination_array):
         """Write the next frame data to the provided numpy array.
         """
         if not self.cap.isOpened():
-            raise StreamError('Stream is closed')
+            raise StreamError(self.name, StreamError.SOURCE_UNAVAILABLE)
         
         ret, frame = self.cap.read(destination_array)
         if not ret:
-            raise StreamError('Could not read data from stream.')
+            raise StreamError(self.name, StreamError.NO_RETURN_VALUE)
     
     def get_frame(self):
         """Read the next frame data and return it as a new numpy array.
         """
         if not self.cap.isOpened():
-            raise StreamError('Stream is closed')
+            raise StreamError(self.name, StreamError.SOURCE_UNAVAILABLE)
     
         ret, frame = self.cap.read()
         if not ret:
-            raise StreamError('Could not read data from stream.')
+            raise StreamError(self.name, StreamError.NO_RETURN_VALUE)
         
         return frame
     
     def __enter__(self):
+        logger.trace('Acquiring capture device.')
         return self
     
     def __exit__(self, type, value, traceback):
-        logger.debug('Releasing capture device')
+        logger.trace('Releasing capture device.')
         self.cap.release()
 
 
 class StreamError(Exception):
-    pass
+    SOURCE_UNAVAILABLE = 1
+    NO_RETURN_VALUE = 2
+    BAD_COMMAND_SEQUENCE = 3
+    
+    code_defaults = MappingProxyType({
+        SOURCE_UNAVAILABLE: 'stream device is unavailable',
+        NO_RETURN_VALUE: 'could not read data from stream',
+        BAD_COMMAND_SEQUENCE: 'order of command sequence is incorrect',
+        })
+    
+    def __init__(self, stream_name, code, message=None):
+        self.stream_name = stream_name
+        self.code = code
+        
+        # Always get the default message, since it also validates the code.
+        default_message = self.code_defaults[code]
+        if not message:
+            message = default_message
+        
+        message = f'<{stream_name}> - {message}'
+        if not message.endswith('.'):
+            message += '.'
+        
+        super().__init__(message)
 
 
 class SharedExclusiveLock:
