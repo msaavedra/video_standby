@@ -1,168 +1,97 @@
 
-from contextlib import contextmanager
-import itertools
-from queue import Queue
-from multiprocessing import Condition, Lock, Process
+from multiprocessing import Process, Queue
 from multiprocessing.sharedctypes import RawArray, RawValue, Value
 import os
 import sys
 import time
-from types import MappingProxyType
 
 import cv2
 import numpy as np
 
-from video_standby.config import settings
-from video_standby.logger import Logger
+from .buffer import Buffer
+from .config import settings
+from .errors import StreamError
+from .lock import SharedExclusiveLock
+from .logger import Logger
+from .source import VideoSource
 
 
 logger = Logger(settings)
 
-STREAM_STATUS_INITIALIZING = 0
-STREAM_STATUS_STANDBY = 1
-STREAM_STATUS_RECORDING = 2
-STREAM_STATUS_CLOSED = 3
 
-STREAM_STATUS_LABELS = {
-    STREAM_STATUS_INITIALIZING: 'initializing',
-    STREAM_STATUS_STANDBY: 'standby',
-    STREAM_STATUS_RECORDING: 'recording',
-    STREAM_STATUS_CLOSED: 'closed'
-    }
-
-
-class VideoStream:
+class VideoStream(Process):
+    STATUS_INITIALIZING = 0
+    STATUS_BUFFERING = 1
+    STATUS_RECORDING = 2
+    STATUS_CLOSED = 3
     
-    def __init__(self, name, start_immediately=True):
-        self._status = Value('B', STREAM_STATUS_INITIALIZING)
-        self.buffering_process = None
-        self.recording_process = None
+    STREAM_STATUS_LABELS = {
+        STATUS_INITIALIZING: 'initializing',
+        STATUS_BUFFERING: 'buffering',
+        STATUS_RECORDING: 'recording',
+        STATUS_CLOSED: 'closed'
+        }
+    
+    def __init__(self, name, settings):
+        super().__init__()
         
+        self._status = Value('B', self.STATUS_CLOSED)
         self.name = name
-        logger.debug(str(settings.sources))
-        self.settings = settings.sources[name]
         self.command_queue = Queue()
-        
-        # Load stream properties from a sample frame
-        with StreamSource(name) as source:
-            sample_frame = source.get_frame()
-        
-        self.frame_shape = sample_frame.shape
-        self.height, self.width, self.channels = self.frame_shape
-        self.frame_dtype = sample_frame.dtype
-        self.color_depth = self.frame_dtype.itemsize
-        self.frame_size = sample_frame.nbytes
-        del sample_frame
-        
-        # Set up a buffer
-        self.frame_count = self.settings.buffer_frames
-        self.frames = tuple(
-            RawArray('B', self.frame_size) for _ in range(self.frame_count)
-            )
-        self.frame_locks = tuple(
-            SharedExclusiveLock() for _ in range(self.frame_count)
-            )
-        self.writer_index_cycle = itertools.cycle(range(self.frame_count))
-        self.write_boundary = Condition()
-        self.last_write_position = RawValue('I', 0)
-        
-        if start_immediately:
-            self.start_buffering()
+        self.properties = StreamProperties(name)
     
     @property
     def status(self):
         with self._status.get_lock():
             return self._status.value
     
-    def start_buffering(self):
+    def run(self):
         with self._status.get_lock():
-            if self._status.value == STREAM_STATUS_CLOSED:
-                raise StreamError(
-                    self.name,
-                    StreamError.BAD_COMMAND_SEQUENCE,
-                    "can't buffer a closed stream"
-                    )
-            
-            self.buffering_process = Process(
-                target=buffer,
-                args=(self,),
-                )
-            self.buffering_process.start()
-            
-            self._status.value = STREAM_STATUS_STANDBY
+            self._status.value = self.STATUS_INITIALIZING
+        
+            self.properties.update(self.name)
+        
+            buffering_process = Buffer(self)
+            buffering_process.start()
+            self._status.value = self.STATUS_BUFFERING
+    
+    def start_buffering(self):
+        pass
     
     def start_recording(self):
         with self._status.get_lock():
-            if self._status.value == STREAM_STATUS_CLOSED:
+            if self._status.value == self.STATUS_CLOSED:
                 raise StreamError(
                     self.name,
                     StreamError.BAD_COMMAND_SEQUENCE,
                     "can't record a closed stream"
                     )
             
-            if self._status.value == STREAM_STATUS_INITIALIZING:
+            if self._status.value == self.STATUS_INITIALIZING:
                 raise StreamError(
                     self.name,
                     StreamError.BAD_COMMAND_SEQUENCE,
                     "can't record a stream that is not buffered"
                     )
             
-            self._status.value = STREAM_STATUS_RECORDING
+            self._status.value = self.STATUS_RECORDING
             self.recording_process = Process(
-                target=record,
+                target=VideoStream.record,
                 args=(self,),
                 )
             self.recording_process.start()
     
     def stop_recording(self):
         with self._status.get_lock():
-            if self._status.value != STREAM_STATUS_RECORDING:
+            if self._status.value != self.STATUS_RECORDING:
                 return
             
-            self._status.value = STREAM_STATUS_STANDBY
-
-    def write_to_buffer(self):
-        """Write frames continuously to the buffer until closed.
-        """
-        logger.info(f'Starting to buffer {self.name} stream.')
+            self._status.value = self.STATUS_BUFFERING
     
-        with StreamSource(self.name) as source:
-            while self.status != STREAM_STATUS_CLOSED:
-                index = next(self.writer_index_cycle)
-                lock = self.frame_locks[index]
-            
-                with lock.exclusive:
-                    numpy_frame = np.ndarray(
-                        self.frame_shape,
-                        dtype=self.frame_dtype,
-                        buffer=self.frames[index]
-                        )
-                    try:
-                        logger.trace('Capturing frame data to numpy array...')
-                        source.write_frame(numpy_frame)
-                        logger.trace('Finished capturing.')
-                    except StreamError as e:
-                        if e.code == StreamError.SOURCE_UNAVAILABLE:
-                            logger.warning(
-                                f'{e.stream_name} - stream is unavailable.'
-                                )
-                            time.sleep(5)
-                        else:
-                            logger.error(str(e))
-                            raise
-                    except KeyboardInterrupt:
-                        continue
-            
-                # Put up a boundary so that readers can't overtake
-                with self.write_boundary:
-                    self.last_write_position.value = index
-                    self.write_boundary.notify_all()
-    
-        logger.info(f'Finished buffering {self.name} stream.')
-
     def write_to_file(self):
         """Copy frames out of the buffer and encode them into a video file.
         """
+        props = self.properties.to_dict()
         logger.info('Starting to record stream.')
         reader = self.create_reader()
         output_path = os.path.join(
@@ -177,17 +106,22 @@ class VideoStream:
         writer = cv2.VideoWriter(
             output_path,
             int(cv2.VideoWriter_fourcc(*'mp4v')),
-            30.0,
-            (self.width, self.height),
+            props['frame_rate'],
+            (props['width'], props['height']),
             )
         try:
+            index = None
             for index, frame in reader:
                 writer.write(frame)
-                if self.status != STREAM_STATUS_RECORDING:
+                if self.status != self.STATUS_RECORDING:
                     logger.info('Received record stop command.')
                     break
-            remaining_frames = self.get_distance_to_write_boundary(
-                index) - 1
+            
+            if index is None:
+                remaining_frames = 0
+            else:
+                remaining_frames = self.get_distance_to_write_boundary(
+                    index) - 1
             logger.debug(f'{remaining_frames} remaining frames in buffer.')
             for i in range(remaining_frames):
                 index, frame = next(reader)
@@ -196,47 +130,23 @@ class VideoStream:
         finally:
             writer.release()
             logger.info('Finished recording stream.')
-
-    def create_reader(self, skip_frames=0):
-        with self.write_boundary:
-            index = self.last_write_position.value - (self.frame_count * .75)
-            index = int(index) % self.frame_count
     
-        while True:
-            # Wait if we're overtaking the writer
-            with self.write_boundary:
-                if index == self.last_write_position.value:
-                    self.write_boundary.wait()
-            
-            # Yield the frame if we haven't been instructed to skip it.
-            if index % (skip_frames + 1) == 0:
-                yield index, self.copy_frame(index)
-            
-            index = (index + 1) % self.frame_count
-    
-    def copy_frame(self, index):
-        lock = self.frame_locks[index]
-        with lock.shared:
-            numpy_frame = np.ndarray(
-                self.frame_shape,
-                dtype=self.frame_dtype,
-                buffer=self.frames[index]
-                )
-            return numpy_frame.copy()
+    # A static method suitable for use as a subprocess target.
+    record = staticmethod(write_to_file)
     
     def get_distance_to_write_boundary(self, index):
         with self.write_boundary:
             write_position = self.last_write_position.value
         
         if index <= write_position:
-                distance = write_position - index
+            distance = write_position - index
         else:
             distance = write_position + self.frame_count - index
         
         logger.debug(
             f'Index-{index}, '
             f'Boundary-{write_position}, '
-            f'Size-{self.frame_count}, ',
+            f'Size-{self.frame_count}, '
             f'Distance-{distance}'
             )
         
@@ -244,10 +154,10 @@ class VideoStream:
     
     def close(self):
         with self._status.get_lock():
-            if self._status.value == STREAM_STATUS_CLOSED:
+            if self._status.value == self.STATUS_CLOSED:
                 return
             
-            self._status.value = STREAM_STATUS_CLOSED
+            self._status.value = self.STATUS_CLOSED
         
         try:
             if self.buffering_process:
@@ -266,134 +176,154 @@ class VideoStream:
         return '%s<%s> (%s)' % (
             self.__class__.__name__,
             self.name,
-            STREAM_STATUS_LABELS[self.status],
+            self.STREAM_STATUS_LABELS[self.status],
             )
 
 
-class StreamSource:
-    
-    def __init__(self, name):
-        self.name = name
-        self.cap = cv2.VideoCapture(settings.sources[name].location)
-    
-    def write_frame(self, destination_array):
-        """Write the next frame data to the provided numpy array.
-        """
-        if not self.cap.isOpened():
-            raise StreamError(self.name, StreamError.SOURCE_UNAVAILABLE)
-        
-        ret, frame = self.cap.read(destination_array)
-        if not ret:
-            raise StreamError(self.name, StreamError.NO_RETURN_VALUE)
-    
-    def get_frame(self):
-        """Read the next frame data and return it as a new numpy array.
-        """
-        if not self.cap.isOpened():
-            raise StreamError(self.name, StreamError.SOURCE_UNAVAILABLE)
-    
-        ret, frame = self.cap.read()
-        if not ret:
-            raise StreamError(self.name, StreamError.NO_RETURN_VALUE)
-        
-        return frame
-    
-    def __enter__(self):
-        logger.trace('Acquiring capture device.')
-        return self
-    
-    def __exit__(self, type, value, traceback):
-        logger.trace('Releasing capture device.')
-        self.cap.release()
-
-
-class StreamError(Exception):
-    SOURCE_UNAVAILABLE = 1
-    NO_RETURN_VALUE = 2
-    BAD_COMMAND_SEQUENCE = 3
-    
-    code_defaults = MappingProxyType({
-        SOURCE_UNAVAILABLE: 'stream device is unavailable',
-        NO_RETURN_VALUE: 'could not read data from stream',
-        BAD_COMMAND_SEQUENCE: 'order of command sequence is incorrect',
-        })
-    
-    def __init__(self, stream_name, code, message=None):
-        self.stream_name = stream_name
-        self.code = code
-        
-        # Always get the default message, since it also validates the code.
-        default_message = self.code_defaults[code]
-        if not message:
-            message = default_message
-        
-        message = f'<{stream_name}> - {message}'
-        if not message.endswith('.'):
-            message += '.'
-        
-        super().__init__(message)
-
-
-class SharedExclusiveLock:
+class StreamProperties:
     
     def __init__(self):
-        self.exclusive_lock = Lock()
-        self.shared_counter_lock = Lock()
-        self.shared_counter = RawValue('B', 0)
+        self._lock = SharedExclusiveLock()
+        self._frame_shape = RawArray('I', 3)  # 3-array of unsigned ints
+        self._dtype_char = RawValue('c')  # char
+        self._frame_size = RawValue('L')  # unsigned long
+        self._frame_rate = RawValue('I')
+    
+    def _get_frame_shape(self):
+        return tuple(self._frame_shape)
+    
+    def _get_frame_dtype(self):
+        return np.typeDict[self._dtype_char.value.decode('ascii')]()
+    
+    def _get_frame_size(self):
+        return self._frame_size.value
+    
+    def _get_frame_rate(self):
+        return self._frame_rate.value
+    
+    def update(self, source_name):
+        with VideoSource(source_name) as source:
+            frame_rate = source.get_frame_rate()
+            sample_frame = source.get_frame()
         
-    def acquire_shared(self):
-        logger.trace('Attempting to acquire lock in shared mode...')
-        with self.shared_counter_lock:
-            self.shared_counter.value += 1
-            if self.shared_counter.value == 1:
-                self.exclusive_lock.acquire()
-        logger.trace('Acquired lock in shared mode.')
+        with self._lock.exclusive:
+            for i, value in enumerate(sample_frame.shape):
+                self._frame_shape[i] = value
+            self._dtype_char.value = sample_frame.dtype.char.encode('ascii')
+            self._frame_size.value = sample_frame.nbytes
+            self._frame_rate.value = frame_rate
     
-    def release_shared(self):
-        with self.shared_counter_lock:
-            if self.shared_counter.value < 1:
-                raise ValueError('Cannot decrement shared counter below zero.')
-            self.shared_counter.value -= 1
-            if self.shared_counter.value == 0:
-                self.exclusive_lock.release()
-        logger.trace('Released lock in shared mode.')
-    
-    @property
-    @contextmanager
-    def shared(self):
-        self.acquire_shared()
-        try:
-            yield self
-        finally:
-            self.release_shared()
-    
-    def acquire_exclusive(self):
-        logger.trace('Attempting to acquire lock in exclusive mode...')
-        self.shared_counter_lock.acquire()
-        self.exclusive_lock.acquire()
-        logger.trace('Acquired lock in exclusive mode.')
-    
-    def release_exclusive(self):
-        self.exclusive_lock.release()
-        self.shared_counter_lock.release()
-        logger.trace('Released lock in exclusive mode.')
+    def to_dict(self):
+        with self._lock.shared:
+            frame_dtype = self._get_frame_dtype()
+            height, width, channels = self._get_frame_shape()
+            return {
+                'frame_size': self._get_frame_size(),
+                'frame_rate': self._get_frame_rate(),
+                'height': height,
+                'width': width,
+                'color_channels': channels,
+                'color_depth': frame_dtype.itemsize,
+                }
     
     @property
-    @contextmanager
-    def exclusive(self):
-        self.acquire_exclusive()
-        try:
-            yield self
-        finally:
-            self.release_exclusive()
+    def frame_shape(self):
+        with self._lock.shared:
+            return tuple(self._frame_shape)
+    
+    @property
+    def frame_dtype(self):
+        with self._lock.shared:
+            return self._get_frame_dtype()
+    
+    @property
+    def color_depth(self):
+        return self.frame_dtype.itemsize
+    
+    @property
+    def frame_size(self):
+        with self._lock.shared:
+            return self._get_frame_size()
+    
+    @property
+    def frame_rate(self):
+        with self._lock.shared:
+            return self._get_frame_rate()
 
-
+'''
 def buffer(stream):
     stream.write_to_buffer()
 
 
 def record(stream):
     stream.write_to_file()
+'''
+
+#@profiled
+def output_hls(stream):
+    import subprocess
+    import select
+    height, width, channels = stream.properties.frame_shape
+    height //= 2
+    width //= 2
+    frame_rate = str(stream.properties.frame_rate)
+    reader = stream.create_reader(skip_frames=0)
+    args = (
+        'ffmpeg',
+        '-y',
+        '-hide_banner',
+        '-f', 'rawvideo',
+        '-video_size', f'{width}x{height}',
+        '-pixel_format', 'bgr24',
+        '-i', '-',
+        '-r', frame_rate,
+        '-framerate', frame_rate,
+        '-an',
+        '-c:v', 'libx264',
+        '-crf', '23',
+        '-preset', 'veryfast',
+        '-tune', 'zerolatency',
+        '-pix_fmt', 'yuv420p',
+        '-f', 'hls',
+        '-hls_time', '2',
+        '-hls_list_size', '5',
+        '-hls_wrap', '10',
+        '/home/mike/video_standby/stream.m3u8',
+        )
+    with open('/home/mike/video_standby/ffmpeg.log', 'w') as ffmpeg_stderr:
+        ffmpeg = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stderr=ffmpeg_stderr,
+            close_fds=True,
+            )
+        
+        try:
+            count = 0
+            start = time.time()
+            for index, frame in reader:
+                frame = cv2.resize(frame, (width, height))
+                while True:
+                    try:
+                        ffmpeg.stdin.write(frame.tostring())
+                    except BrokenPipeError:
+                        logger.error('Broken pipe to ffmpeg.')
+                        raise
+                    else:
+                        break
+                        
+                count += 1
+                if count >= 2500:
+                    elapsed = time.time() - start
+                    logger.info(
+                        f'Wrote {count} frames in {elapsed} seconds:'
+                        f' {int(count / elapsed)} frames per second.'
+                        )
+                    break
+        finally:
+            ffmpeg.stdin.close()
+            ffmpeg.wait()
+            logger.info(f'ffmpeg returncode: {ffmpeg.returncode}')
 
 
 def test():
@@ -414,6 +344,13 @@ def test():
         names = []
     
     streams = [VideoStream(name) for name in names]
+    
+    stream = streams[0]
+    stream.start_buffering()
+    logger.debug('Starting to create HLS files...')
+    output_hls(stream)
+    
+    return
     
     import threading
     threads = []

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 
-from video_standby.daemon import Daemon
+from video_standby.daemon import WebDaemon
 
 if __name__ == '__main__':
-    daemon = Daemon()
+    daemon = WebDaemon()
     daemon.run()

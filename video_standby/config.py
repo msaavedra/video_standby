@@ -43,12 +43,22 @@ class Settings(object):
         }
     default_source_settings = {
         'location': 'rtsp://localhost/',
+        'enabled': False,
         'codec': 'h264',
         'save_directory': os.path.join(
             os.path.expanduser('~'),
             'video_standby'
             ),
-        'buffer_frames': 60,
+        'buffer_time': 2,
+        'motion_detection': {
+            "enabled": False,
+            "sensitivity": "MEDIUM",
+            "min_recording_time": 15,
+            },
+        'output_streams': {
+            'size_divisors': [4, 8],
+            
+            },
         }
     
     def __init__(self, path):
@@ -62,8 +72,11 @@ class Settings(object):
     def __getattr__(self, name):
         return self._settings[name]
     
-    def reload_on_update(self):
-        return False  # FIXME: add reloading support
+    def load_updates(self):
+        mtime = os.path.getmtime(self.path)
+        if mtime > self.mtime:
+            self._settings = self._load()
+        self.mtime = mtime
     
     def _load(self):
         try:
@@ -116,11 +129,20 @@ class SettingsNamespace(dict):
     
     def __getattr__(self, name):
         try:
-            return self[name]
+            value = self[name]
         except KeyError:
             raise AttributeError(
                 f"{type(self).__name__} object has no attribute '{name}'",
                 )
+        
+        if type(value) == dict:
+            # Wrap dicts in a SettingsNamespace object. We don't use
+            # isinstance() to detect a dict because that will
+            # also match existing SettingsNamespace instances, which we
+            # want to leave alone.
+            return SettingsNamespace(value)
+        else:
+            return value
     
     def __setattr__(self, name, value):
         raise NotImplementedError()
@@ -132,3 +154,9 @@ class SettingsNamespace(dict):
 settings = Settings(
     os.environ.get('VIDEO_STANDBY_SETTINGS_PATH', DEFAULT_SETTINGS_PATH)
     )
+
+
+def get_settings():
+    return Settings(
+        os.environ.get('VIDEO_STANDBY_SETTINGS_PATH', DEFAULT_SETTINGS_PATH)
+        )

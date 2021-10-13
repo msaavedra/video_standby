@@ -1,41 +1,85 @@
 
 import atexit
 import json
+import multiprocessing
 from multiprocessing.util import _exit_function
+import queue
 import threading
 
 import falcon
 from falcon.routing.converters import BaseConverter
 from gunicorn.app.base import BaseApplication
+import zmq
 
-from video_standby.config import settings
-from video_standby.logger import Logger
-from video_standby.stream import VideoStream, STREAM_STATUS_LABELS, StreamError
+from .config import settings
+from .errors import StreamError
+from .logger import Logger
+from .stream import VideoStream, StreamGroup
+
 
 
 logger = Logger(settings)
 
 
+class Daemon:
+    
+    def __init__(self):
+        self._streams = {}
+    
+    def run(self):
+        while True:
+            updated = settings.load_updates()
+            if updated:
+                self.streams.update(settings)
+
+    def __init__(self, settings=None):
+        if settings:
+            self._stream_map = {
+                k: VideoStream(k, v) for (k, v) in settings.sources.items()
+                }
+        else:
+            self._stream_map = {}
+    
+    def update(self, settings):
+        for name, stream_settings in settings.sources.items():
+    
+    def __getitem__(self, name):
+        return self._stream_map[name]
+    
+    def __iter__(self):
+        yield from self._stream_map.values()
+
+
+class StreamManager:
+    
+    def __init__(self, name):
+        self.stream = VideoStream.start_new(name)
+
+
 class VideoStandbyAPI(falcon.API):
     
-    def __init__(self):
-        pass
+    def __init__(self, video_streams, *args, **kwargs):
+        self.video_streams = video_streams
+        super().__init__(*args, **kwargs)
 
 
-class Daemon(BaseApplication):
+class WebDaemon(BaseApplication):
     
-    def __init__(self):
-        self.api = falcon.API()
+    def __init__(self, video_streams):
+        self.api = VideoStandbyAPI(video_streams)
         self.api.router_options.converters['stream'] = StreamRouteConverter
         self.api.add_route(
-            '/streams/{stream:stream}',
-            StreamResource(),
+            '/streams/{stream_name}',
+            resources.StreamResource(video_streams),
             )
         self.api.add_route(
-            '/streams/{stream:stream}/command',
-            StreamCommandResource(),
+            '/streams/{stream_name}/command',
+            resources.StreamCommandResource(video_streams),
             )
         super().__init__(self)
+    
+    def init(self, parser, opts, args):
+        pass
     
     def load_config(self):
         self.cfg.set(
@@ -72,34 +116,3 @@ class StreamRouteConverter(BaseConverter):
             return self.streams[value]
         except KeyError:
             return None
-
-
-class StreamResource:
-    
-    def on_get(self, req, resp, stream):
-        resp.body = json.dumps({
-            'name': stream.name,
-            'height': stream.height,
-            'width': stream.width,
-            'channels': stream.channels,
-            'color_depth': stream.color_depth,
-            'status': STREAM_STATUS_LABELS[stream.status]
-            })
-        resp.content_type = 'application/json'
-
-
-class StreamCommandResource:
-    
-    def on_post(self, req, resp, stream):
-        command = req.bounded_stream.read().decode()
-        logger.info(f'Command: {command}')
-        if command == 'start_recording':
-            stream.start_recording()
-        elif command == 'stop_recording':
-            stream.stop_recording()
-        else:
-            resp.status = falcon.HTTP_409
-            return
-        
-        resp.status = falcon.HTTP_200
-        resp.body = 'success'
